@@ -1,5 +1,6 @@
 #include "blazekv/socket.hpp"
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -11,9 +12,6 @@
 
 #if defined(__linux__)
 #include <sched.h>
-#endif
-#if defined(__APPLE__)
-#include <arpa/inet.h>
 #endif
 
 namespace blazekv {
