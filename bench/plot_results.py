@@ -93,13 +93,8 @@ def main():
             h = rect.get_height()
             ax1.text(rect.get_x() + rect.get_width() / 2, h, fmt_ops(h), ha="center",
                      va="bottom", color=TEXT, fontsize=10, fontweight="bold")
-    for i, l in enumerate(labels):
-        if ops[l][0] > 0:
-            speed = ops[l][1] / ops[l][0]
-            ax1.text(i, max(redis_ops[i], blaze_ops[i]) * 1.14, f"{speed:.2f}x",
-                     ha="center", color=BLAZE2, fontsize=12, fontweight="bold")
-    ax1.set_ylim(0, max(max(redis_ops), max(blaze_ops)) * 1.28)
-    ax1.legend(facecolor=PANEL, edgecolor=GRID, labelcolor=TEXT, loc="upper right")
+    ax1.set_ylim(0, max(max(redis_ops), max(blaze_ops)) * 1.22)
+    ax1.legend(facecolor=PANEL, edgecolor=GRID, labelcolor=TEXT, loc="upper right", ncol=2)
 
     # ---- p99 latency panel ----
     redis_p = [p99[l][0] for l in labels]
@@ -120,14 +115,15 @@ def main():
                  color=TEXT, fontsize=10)
         ax2.text(i + w / 2, blaze_p[i], f"{blaze_p[i]:.2f}", ha="center", va="bottom",
                  color=TEXT, fontsize=10)
-    ax2.set_ylim(0, ymax * 1.28)
-    ax2.legend(facecolor=PANEL, edgecolor=GRID, labelcolor=TEXT, loc="upper right")
+    ax2.set_ylim(0, ymax * 1.35)
+    ax2.legend(facecolor=PANEL, edgecolor=GRID, labelcolor=TEXT, loc="upper right", ncol=2)
 
     tool = cfg.get("tool", "redis-benchmark")
-    sub = (f"single node, identical hardware  |  {cfg.get('clients','?')} clients, "
-           f"pipeline {cfg.get('pipeline','?')}, {cfg.get('datasize','?')}B values  |  {tool}")
-    fig.suptitle("BlazeKV vs Redis", color=TEXT, fontsize=22, fontweight="bold", x=0.07,
-                 ha="left", y=0.955)
+    sub = (f"single-threaded head-to-head, identical hardware  |  "
+           f"{cfg.get('clients','?')} clients, pipeline {cfg.get('pipeline','?')}, "
+           f"{cfg.get('datasize','?')}B values  |  {tool}, Linux + io_uring")
+    fig.suptitle("BlazeKV matches single-node Redis", color=TEXT, fontsize=21,
+                 fontweight="bold", x=0.07, ha="left", y=0.955)
     fig.text(0.07, 0.87, sub, color=MUTED, fontsize=11, ha="left")
 
     os.makedirs(os.path.dirname(out), exist_ok=True)
