@@ -172,7 +172,10 @@ void Shard::on_conn_ready(Connection* c, std::uint32_t flags) {
         return;
     }
     if (flags & kRead) handle_readable(c);
-    if (!c->closing && (flags & kWrite)) handle_writable(c);
+    if (flags & kWrite) handle_writable(c);
+    // Single close decision: only after all owed replies (including in-flight
+    // cross-shard ones) have been produced and drained to the socket.
+    if (c->closing && c->pipeline.empty() && c->out_sent >= c->out.size()) close_conn(c);
 }
 
 void Shard::handle_readable(Connection* c) {
@@ -197,28 +200,46 @@ void Shard::handle_readable(Connection* c) {
         }
     }
     if (c->in.size() > kMaxInlineBuffer) c->closing = true;
-    if (!c->blocked) process_input(c);
+    process_input(c);
     handle_writable(c);
-    if (c->closing && c->out_sent >= c->out.size()) close_conn(c);
+    // Closing is decided by the caller (on_conn_ready) once nothing is owed.
 }
 
 void Shard::process_input(Connection* c) {
     std::size_t pos = 0;
-    while (!c->blocked && !c->closing) {
+    while (!c->closing) {
         Command cmd;
         std::size_t consumed = 0;
         ParseStatus st = c->parser.parse(c->in.data() + pos, c->in.size() - pos, cmd, consumed);
         if (st == ParseStatus::NeedMore) break;
         if (st == ParseStatus::ProtocolError) {
-            ReplyBuilder rb(c->out);
+            // Enqueue the protocol error in order behind any in-flight replies.
+            const std::uint64_t seq = c->next_seq++;
+            std::string bytes;
+            ReplyBuilder rb(bytes);
             rb.error(std::string("ERR Protocol error: ").append(c->parser.error()));
+            c->pipeline[seq] = PendingReply{true, std::move(bytes), PendingReply::Kind::Single, 0,
+                                            {}, 0};
             c->closing = true;
             break;
         }
         pos += consumed;
+        // Each parsed command is dispatched without blocking; remote commands run
+        // concurrently across shards while later pipelined commands keep flowing.
         if (!cmd.argv.empty()) dispatch(c, cmd);
     }
     if (pos > 0) c->in.erase(0, pos);
+    flush_ready(c);
+}
+
+// Appends every leading ready reply (in submission order) to the output buffer.
+void Shard::flush_ready(Connection* c) {
+    while (!c->pipeline.empty()) {
+        auto it = c->pipeline.begin();
+        if (!it->second.ready) break;  // an earlier reply is still pending
+        c->out.append(it->second.bytes);
+        c->pipeline.erase(it);
+    }
 }
 
 void Shard::handle_writable(Connection* c) {
@@ -239,7 +260,6 @@ void Shard::handle_writable(Connection* c) {
         c->out_sent = 0;
     }
     update_interest(c);
-    if (c->closing && c->out_sent >= c->out.size()) close_conn(c);
 }
 
 void Shard::update_interest(Connection* c) {
@@ -259,23 +279,34 @@ void Shard::close_conn(Connection* c) {
 // Command routing and execution
 // ---------------------------------------------------------------------------
 void Shard::dispatch(Connection* c, const Command& cmd) {
+    const std::uint64_t seq = c->next_seq++;
+    auto local_reply = [&](auto&& fill) {
+        std::string bytes;
+        fill(bytes);
+        c->pipeline[seq] = PendingReply{true, std::move(bytes), PendingReply::Kind::Single, 0, {}, 0};
+    };
+
     std::string name;
     lowercase_into(cmd.name(), name);
     const CommandSpec* spec = CommandTable::instance().find(name);
     if (spec == nullptr) {
-        ReplyBuilder rb(c->out);
-        rb.error(std::string("ERR unknown command '").append(cmd.name()).append("'"));
+        local_reply([&](std::string& b) {
+            ReplyBuilder rb(b);
+            rb.error(std::string("ERR unknown command '").append(cmd.name()).append("'"));
+        });
         return;
     }
     if (!arity_ok(spec, cmd.argv.size())) {
-        ReplyBuilder rb(c->out);
-        rb.error(std::string("ERR wrong number of arguments for '").append(name).append("' command"));
+        local_reply([&](std::string& b) {
+            ReplyBuilder rb(b);
+            rb.error(std::string("ERR wrong number of arguments for '").append(name).append("' command"));
+        });
         return;
     }
 
     const auto keys = extract_keys(*spec, cmd);
     if (keys.empty()) {
-        execute_local(c, cmd);
+        local_reply([&](std::string& b) { exec_core(cmd, b); });
         return;
     }
 
@@ -291,9 +322,9 @@ void Shard::dispatch(Connection* c, const Command& cmd) {
 
     if (single) {
         if (first_owner == id_)
-            execute_local(c, cmd);
+            local_reply([&](std::string& b) { exec_core(cmd, b); });
         else
-            begin_single_forward(c, first_owner, cmd);
+            begin_single_forward(c, seq, first_owner, cmd);
         return;
     }
 
@@ -301,10 +332,12 @@ void Shard::dispatch(Connection* c, const Command& cmd) {
     static const std::unordered_map<std::string_view, int> decomposable = {
         {"mget", 1}, {"mset", 2}, {"del", 1}, {"unlink", 1}, {"exists", 1}, {"touch", 1}};
     if (decomposable.count(name)) {
-        begin_multikey(c, cmd, keys);
+        begin_multikey(c, seq, cmd, keys);
     } else {
-        ReplyBuilder rb(c->out);
-        rb.error("CROSSSLOT Keys in request map to different shards");
+        local_reply([&](std::string& b) {
+            ReplyBuilder rb(b);
+            rb.error("CROSSSLOT Keys in request map to different shards");
+        });
     }
 }
 
@@ -347,8 +380,6 @@ void Shard::exec_replay(const Command& cmd) {
     spec->fn(ctx);
 }
 
-void Shard::execute_local(Connection* c, const Command& cmd) { exec_core(cmd, c->out); }
-
 void Shard::execute_owned(const std::vector<std::string>& args, std::string& out) {
     Command cmd;
     cmd.argv.reserve(args.size());
@@ -356,11 +387,12 @@ void Shard::execute_owned(const std::vector<std::string>& args, std::string& out
     exec_core(cmd, out);
 }
 
-void Shard::begin_single_forward(Connection* c, unsigned target, const Command& cmd) {
-    c->blocked = true;
-    c->cross.kind = CrossOp::Kind::Single;
-    c->cross.remaining = 1;
-    c->cross.frags.assign(1, std::string{});
+// Forwards a whole single-owner command to its owning shard. The reply slot at
+// `seq` stays pending until the owner responds; meanwhile the connection keeps
+// parsing and dispatching later pipelined commands.
+void Shard::begin_single_forward(Connection* c, std::uint64_t seq, unsigned target,
+                                 const Command& cmd) {
+    c->pipeline[seq] = PendingReply{false, {}, PendingReply::Kind::Single, 1, {std::string{}}, 0};
 
     std::vector<std::string> args;
     args.reserve(cmd.argv.size());
@@ -370,36 +402,36 @@ void Shard::begin_single_forward(Connection* c, unsigned target, const Command& 
     Shard* origin = this;
     Shard* dst = &server_.shard(target);
     metrics_.cross_shard_ops.fetch_add(1, std::memory_order_relaxed);
-    dst->post([dst, origin, cid, args = std::move(args)]() mutable {
+    dst->post([dst, origin, cid, seq, args = std::move(args)]() mutable {
         std::string reply;
         dst->execute_owned(args, reply);
-        origin->post([origin, cid, reply = std::move(reply)]() mutable {
-            origin->complete_fragment(cid, 0, std::move(reply), false, 0);
+        origin->post([origin, cid, seq, reply = std::move(reply)]() mutable {
+            origin->complete_fragment(cid, seq, 0, std::move(reply), false, 0);
         });
     });
 }
 
-void Shard::begin_multikey(Connection* c, const Command& cmd,
+// Splits a multi-key command (MGET/MSET/DEL/UNLINK/EXISTS/TOUCH) into single-key
+// sub-requests routed to each key's owner. They execute in parallel across shards
+// and the origin reassembles the reply once all fragments return.
+void Shard::begin_multikey(Connection* c, std::uint64_t seq, const Command& cmd,
                            const std::vector<std::string_view>& keys) {
     std::string name;
     lowercase_into(cmd.name(), name);
 
-    CrossOp::Kind kind;
+    PendingReply::Kind kind;
     if (name == "mget")
-        kind = CrossOp::Kind::MGet;
+        kind = PendingReply::Kind::MGet;
     else if (name == "mset")
-        kind = CrossOp::Kind::MSet;
+        kind = PendingReply::Kind::MSet;
     else if (name == "exists")
-        kind = CrossOp::Kind::ExistsCount;
+        kind = PendingReply::Kind::ExistsCount;
     else
-        kind = CrossOp::Kind::DelCount;
+        kind = PendingReply::Kind::DelCount;
 
     const int n = static_cast<int>(keys.size());
-    c->blocked = true;
-    c->cross.kind = kind;
-    c->cross.remaining = n;
-    c->cross.frags.assign(static_cast<std::size_t>(n), std::string{});
-    c->cross.accum = 0;
+    c->pipeline[seq] = PendingReply{false, {}, kind, n,
+                                    std::vector<std::string>(static_cast<std::size_t>(n)), 0};
 
     const std::uint64_t cid = c->id;
     Shard* origin = this;
@@ -407,18 +439,19 @@ void Shard::begin_multikey(Connection* c, const Command& cmd,
 
     for (int i = 0; i < n; ++i) {
         std::vector<std::string> sub;
-        const bool is_int = (kind == CrossOp::Kind::DelCount || kind == CrossOp::Kind::ExistsCount);
+        const bool is_int =
+            (kind == PendingReply::Kind::DelCount || kind == PendingReply::Kind::ExistsCount);
         switch (kind) {
-            case CrossOp::Kind::MGet:
+            case PendingReply::Kind::MGet:
                 sub = {"GET", std::string(keys[static_cast<std::size_t>(i)])};
                 break;
-            case CrossOp::Kind::MSet: {
+            case PendingReply::Kind::MSet: {
                 // MSET argv layout: MSET k1 v1 k2 v2 ...; value follows each key.
                 std::string_view val = cmd.argv[static_cast<std::size_t>(2 * i + 2)];
                 sub = {"SET", std::string(keys[static_cast<std::size_t>(i)]), std::string(val)};
                 break;
             }
-            case CrossOp::Kind::ExistsCount:
+            case PendingReply::Kind::ExistsCount:
                 sub = {"EXISTS", std::string(keys[static_cast<std::size_t>(i)])};
                 break;
             default:
@@ -427,57 +460,57 @@ void Shard::begin_multikey(Connection* c, const Command& cmd,
         }
         unsigned target = shard_for(keys[static_cast<std::size_t>(i)]);
         Shard* dst = &server_.shard(target);
-        dst->post([dst, origin, cid, i, is_int, sub = std::move(sub)]() mutable {
+        dst->post([dst, origin, cid, seq, i, is_int, sub = std::move(sub)]() mutable {
             std::string reply;
             dst->execute_owned(sub, reply);
             long long iv = is_int ? parse_resp_integer(reply) : 0;
-            origin->post([origin, cid, i, reply = std::move(reply), is_int, iv]() mutable {
-                origin->complete_fragment(cid, i, std::move(reply), is_int, iv);
+            origin->post([origin, cid, seq, i, reply = std::move(reply), is_int, iv]() mutable {
+                origin->complete_fragment(cid, seq, i, std::move(reply), is_int, iv);
             });
         });
     }
 }
 
-void Shard::complete_fragment(std::uint64_t cid, int index, std::string frag, bool is_int,
-                              long long int_val) {
-    Connection* c = find_conn(cid);
-    if (c == nullptr) return;  // client disconnected while in flight
-    if (is_int)
-        c->cross.accum += int_val;
-    else
-        c->cross.frags[static_cast<std::size_t>(index)] = std::move(frag);
-    if (--c->cross.remaining == 0) finish_cross(c);
-}
-
-void Shard::finish_cross(Connection* c) {
-    ReplyBuilder rb(c->out);
-    switch (c->cross.kind) {
-        case CrossOp::Kind::Single:
-            c->out.append(c->cross.frags[0]);
+// Assembles the final RESP bytes for a completed multi-part reply.
+void Shard::assemble(PendingReply& pr) {
+    std::string bytes;
+    ReplyBuilder rb(bytes);
+    switch (pr.kind) {
+        case PendingReply::Kind::Single:
+            bytes = std::move(pr.frags[0]);
             break;
-        case CrossOp::Kind::MGet:
-            rb.array_header(static_cast<std::int64_t>(c->cross.frags.size()));
-            for (auto& f : c->cross.frags) rb.raw(f);
+        case PendingReply::Kind::MGet:
+            rb.array_header(static_cast<std::int64_t>(pr.frags.size()));
+            for (auto& f : pr.frags) rb.raw(f);
             break;
-        case CrossOp::Kind::MSet:
+        case PendingReply::Kind::MSet:
             rb.simple_string("OK");
             break;
-        case CrossOp::Kind::DelCount:
-        case CrossOp::Kind::ExistsCount:
-            rb.integer(c->cross.accum);
-            break;
-        default:
+        case PendingReply::Kind::DelCount:
+        case PendingReply::Kind::ExistsCount:
+            rb.integer(pr.accum);
             break;
     }
-    c->cross = CrossOp{};
-    c->blocked = false;
-    resume(c);
+    pr.bytes = std::move(bytes);
+    pr.ready = true;
 }
 
-void Shard::resume(Connection* c) {
-    if (!c->closing) process_input(c);
+void Shard::complete_fragment(std::uint64_t cid, std::uint64_t seq, int index, std::string frag,
+                              bool is_int, long long int_val) {
+    Connection* c = find_conn(cid);
+    if (c == nullptr) return;  // client disconnected while in flight
+    auto it = c->pipeline.find(seq);
+    if (it == c->pipeline.end()) return;
+    PendingReply& pr = it->second;
+    if (is_int)
+        pr.accum += int_val;
+    else
+        pr.frags[static_cast<std::size_t>(index)] = std::move(frag);
+    if (--pr.remaining == 0) assemble(pr);
+
+    flush_ready(c);
     handle_writable(c);
-    if (c->closing && c->out_sent >= c->out.size()) close_conn(c);
+    if (c->closing && c->pipeline.empty() && c->out_sent >= c->out.size()) close_conn(c);
 }
 
 // ---------------------------------------------------------------------------

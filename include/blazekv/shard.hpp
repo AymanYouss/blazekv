@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -30,15 +31,19 @@ struct Token {
     Connection* conn;
 };
 
-// State for a command that had to fan out to other shards. The origin shard keeps
-// it on the connection while sub-requests are in flight and assembles the reply
-// once they all return, preserving pipeline order.
-struct CrossOp {
-    enum class Kind { None, Single, MGet, MSet, DelCount, ExistsCount, TypeReply };
-    Kind kind = Kind::None;
+// One slot in a connection's reply pipeline. Local commands fill `bytes` and are
+// marked ready immediately; cross-shard commands leave it pending until their
+// sub-requests return. Slots are keyed by submission sequence and flushed to the
+// socket strictly in order, so pipelining stays correct even though remote ops
+// complete out of order and in parallel across shards.
+struct PendingReply {
+    enum class Kind { Single, MGet, MSet, DelCount, ExistsCount };
+    bool ready = false;
+    std::string bytes;
+    Kind kind = Kind::Single;
     int remaining = 0;
-    std::vector<std::string> frags;  // indexed reply fragments (MGET)
-    long long accum = 0;             // running total (DEL/EXISTS)
+    std::vector<std::string> frags;
+    long long accum = 0;
 };
 
 struct Connection {
@@ -50,9 +55,13 @@ struct Connection {
     RequestParser parser;
     bool want_write = false;
     bool closing = false;
-    bool blocked = false;  // suspended awaiting cross-shard completion
-    CrossOp cross;
+    // Ordered reply pipeline (submission seq -> slot). std::map keeps it sorted so
+    // the front is always the next reply owed to the client.
+    std::map<std::uint64_t, PendingReply> pipeline;
+    std::uint64_t next_seq = 0;
     Token token{TokenKind::Conn, nullptr};
+
+    std::size_t outstanding() const { return pipeline.size(); }
 };
 
 // One shard: a shared-nothing slice of the database pinned to a core. It owns its
@@ -110,18 +119,19 @@ class Shard {
     void update_interest(Connection* c);
     void close_conn(Connection* c);
 
-    // Command routing / execution.
+    // Command routing / execution. Each command is assigned a submission sequence
+    // and dispatched without blocking the connection; replies are flushed in order.
     void dispatch(Connection* c, const Command& cmd);
-    void execute_local(Connection* c, const Command& cmd);
     void exec_core(const Command& cmd, std::string& out);
     void exec_replay(const Command& cmd);
-    void begin_single_forward(Connection* c, unsigned target, const Command& cmd);
-    void begin_multikey(Connection* c, const Command& cmd,
+    void begin_single_forward(Connection* c, std::uint64_t seq, unsigned target,
+                              const Command& cmd);
+    void begin_multikey(Connection* c, std::uint64_t seq, const Command& cmd,
                         const std::vector<std::string_view>& keys);
-    void complete_fragment(std::uint64_t cid, int index, std::string frag, bool is_int,
-                           long long int_val);
-    void finish_cross(Connection* c);
-    void resume(Connection* c);
+    void complete_fragment(std::uint64_t cid, std::uint64_t seq, int index, std::string frag,
+                           bool is_int, long long int_val);
+    void assemble(PendingReply& pr);
+    void flush_ready(Connection* c);
 
     unsigned shard_for(std::string_view key) const;
     Connection* find_conn(std::uint64_t id);
