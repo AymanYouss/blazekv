@@ -36,3 +36,7 @@ bench/results/*.txt
 bench/results/*.svg
 perf.data*
 *.folded
+
+# Alternate build dirs
+build-rel/
+build-*/

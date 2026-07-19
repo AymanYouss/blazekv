@@ -1,0 +1,13 @@
+{
+  "config": {
+    "requests": 1000000, "clients": 50, "threads": 1,
+    "pipeline": 1, "datasize": 32, "tool": "redis-benchmark",
+    "environment": "Linux, io_uring reactor, mimalloc; single command thread; loopback; identical container host"
+  },
+  "results": {
+    "redis":   {"SET": {"ops_sec": 240964, "p99_ms": 0.239},
+                "GET": {"ops_sec": 243191, "p99_ms": 0.231}},
+    "blazekv": {"SET": {"ops_sec": 225734, "p99_ms": 0.263},
+                "GET": {"ops_sec": 224820, "p99_ms": 0.247}}
+  }
+}
