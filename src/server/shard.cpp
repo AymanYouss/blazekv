@@ -119,38 +119,37 @@ void Shard::join() {
 
 void Shard::run() {
     if (server_.config().pin_threads) net::pin_to_core(id_);
-    reactor_->add(listen_fd_, kRead, &listen_token_);
-    reactor_->add(waker_.read_fd(), kRead, &wake_token_);
+    reactor_->add(listen_fd_, kRead, reinterpret_cast<void*>(kTagListen));
+    reactor_->add(waker_.read_fd(), kRead, reinterpret_cast<void*>(kTagWake));
     last_cron_ms_ = now_ms();
 
     ReadyEvent events[512];
     while (running_.load(std::memory_order_acquire)) {
         int n = reactor_->wait(events, 512, 50);
         for (int i = 0; i < n; ++i) {
-            auto* tok = static_cast<Token*>(events[i].token);
-            switch (tok->kind) {
-                case TokenKind::Listen:
+            const auto tok = reinterpret_cast<std::uintptr_t>(events[i].token);
+            switch (tok & kTagMask) {
+                case kTagListen:
                     on_listen_ready();
                     break;
-                case TokenKind::Wake:
+                case kTagWake:
                     waker_.drain();
                     break;
-                case TokenKind::Conn:
-                    // A stale token from earlier in this batch may reference a
-                    // connection already closed this iteration; skip it.
-                    if (!tok->conn->dead) on_conn_ready(tok->conn, events[i].flags);
+                case kTagConn: {
+                    // Look the connection up by id: a stale completion for an
+                    // already-closed fd simply misses and is ignored.
+                    auto it = conns_.find(tok >> 2);
+                    if (it != conns_.end()) on_conn_ready(it->second.get(), events[i].flags);
                     break;
+                }
             }
         }
         // Run any cross-shard completions posted to us by sibling shards.
         mailbox_.drain([](std::function<void()>&& fn) { fn(); });
         cron();
-        // All tokens for this batch have been consumed; reclaim closed connections.
-        pending_delete_.clear();
     }
     // Drain remaining work and flush persistence on shutdown.
     mailbox_.drain([](std::function<void()>&& fn) { fn(); });
-    pending_delete_.clear();
     aof_.close();
 }
 
@@ -162,10 +161,9 @@ void Shard::on_listen_ready() {
         auto conn = std::make_unique<Connection>();
         conn->fd = fd;
         conn->id = next_conn_id_++;
-        conn->token = Token{TokenKind::Conn, conn.get()};
-        Connection* raw = conn.get();
-        conns_.emplace(conn->id, std::move(conn));
-        reactor_->add(fd, kRead, &raw->token);
+        const std::uint64_t cid = conn->id;
+        conns_.emplace(cid, std::move(conn));
+        reactor_->add(fd, kRead, encode_conn_token(cid));
         metrics_.connections_open.fetch_add(1, std::memory_order_relaxed);
         metrics_.connections_total.fetch_add(1, std::memory_order_relaxed);
     }
@@ -270,22 +268,18 @@ void Shard::handle_writable(Connection* c) {
 void Shard::update_interest(Connection* c) {
     std::uint32_t flags = kRead;
     if (c->out_sent < c->out.size()) flags |= kWrite;
-    reactor_->mod(c->fd, flags, &c->token);
+    reactor_->mod(c->fd, flags, encode_conn_token(c->id));
 }
 
 void Shard::close_conn(Connection* c) {
-    if (c->dead) return;  // idempotent
-    c->dead = true;
+    const std::uint64_t id = c->id;
     reactor_->del(c->fd);
     ::close(c->fd);
     metrics_.connections_open.fetch_sub(1, std::memory_order_relaxed);
-    // Park the node instead of freeing it: reactor tokens in the current batch may
-    // still point at it. It is reclaimed at the end of the loop iteration.
-    auto it = conns_.find(c->id);
-    if (it != conns_.end()) {
-        pending_delete_.push_back(std::move(it->second));
-        conns_.erase(it);
-    }
+    // Safe to free immediately: reactor tokens are id values, so any later
+    // completion for this fd (including a lagging io_uring multishot poll) just
+    // misses the id lookup instead of dereferencing freed memory.
+    conns_.erase(id);
 }
 
 // ---------------------------------------------------------------------------

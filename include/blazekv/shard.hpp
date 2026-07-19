@@ -23,13 +23,15 @@ namespace blazekv {
 class Server;
 struct Connection;
 
-// Reactor callback tokens distinguish the listener, the cross-shard waker, and
-// per-client sockets without an extra lookup.
-enum class TokenKind : std::uint8_t { Listen, Wake, Conn };
-struct Token {
-    TokenKind kind;
-    Connection* conn;
-};
+// Reactor tokens are *values*, not pointers: the low 2 bits tag the source
+// (listener / waker / connection) and connection tokens carry the connection id
+// in the high bits. Because we never dereference the token, a stale completion
+// for an already-closed fd (io_uring multishot poll can deliver these after a
+// cancel) simply fails the id lookup and is ignored — no use-after-free.
+enum : std::uintptr_t { kTagListen = 1, kTagWake = 2, kTagConn = 3, kTagMask = 3 };
+inline void* encode_conn_token(std::uint64_t id) {
+    return reinterpret_cast<void*>((static_cast<std::uintptr_t>(id) << 2) | kTagConn);
+}
 
 // One slot in a connection's reply pipeline. Local commands fill `bytes` and are
 // marked ready immediately; cross-shard commands leave it pending until their
@@ -55,12 +57,10 @@ struct Connection {
     RequestParser parser;
     bool want_write = false;
     bool closing = false;
-    bool dead = false;  // closed but kept alive until the current event batch ends
     // Ordered reply pipeline (submission seq -> slot). std::map keeps it sorted so
     // the front is always the next reply owed to the client.
     std::map<std::uint64_t, PendingReply> pipeline;
     std::uint64_t next_seq = 0;
-    Token token{TokenKind::Conn, nullptr};
 
     std::size_t outstanding() const { return pipeline.size(); }
 };
@@ -151,15 +151,9 @@ class Shard {
     MpscQueue<std::function<void()>> mailbox_;
 
     std::unordered_map<std::uint64_t, std::unique_ptr<Connection>> conns_;
-    // Connections closed mid-batch are parked here and freed once the batch (and
-    // its cross-shard completions) finish, so a stale reactor token can never
-    // dereference freed memory.
-    std::vector<std::unique_ptr<Connection>> pending_delete_;
     std::uint64_t next_conn_id_ = 1;
 
     int listen_fd_ = -1;
-    Token listen_token_{TokenKind::Listen, nullptr};
-    Token wake_token_{TokenKind::Wake, nullptr};
 
     std::thread thread_;
     std::atomic<bool> running_{false};
