@@ -136,16 +136,21 @@ void Shard::run() {
                     waker_.drain();
                     break;
                 case TokenKind::Conn:
-                    on_conn_ready(tok->conn, events[i].flags);
+                    // A stale token from earlier in this batch may reference a
+                    // connection already closed this iteration; skip it.
+                    if (!tok->conn->dead) on_conn_ready(tok->conn, events[i].flags);
                     break;
             }
         }
         // Run any cross-shard completions posted to us by sibling shards.
         mailbox_.drain([](std::function<void()>&& fn) { fn(); });
         cron();
+        // All tokens for this batch have been consumed; reclaim closed connections.
+        pending_delete_.clear();
     }
     // Drain remaining work and flush persistence on shutdown.
     mailbox_.drain([](std::function<void()>&& fn) { fn(); });
+    pending_delete_.clear();
     aof_.close();
 }
 
@@ -269,10 +274,18 @@ void Shard::update_interest(Connection* c) {
 }
 
 void Shard::close_conn(Connection* c) {
+    if (c->dead) return;  // idempotent
+    c->dead = true;
     reactor_->del(c->fd);
     ::close(c->fd);
     metrics_.connections_open.fetch_sub(1, std::memory_order_relaxed);
-    conns_.erase(c->id);  // frees the Connection
+    // Park the node instead of freeing it: reactor tokens in the current batch may
+    // still point at it. It is reclaimed at the end of the loop iteration.
+    auto it = conns_.find(c->id);
+    if (it != conns_.end()) {
+        pending_delete_.push_back(std::move(it->second));
+        conns_.erase(it);
+    }
 }
 
 // ---------------------------------------------------------------------------

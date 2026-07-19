@@ -55,6 +55,7 @@ struct Connection {
     RequestParser parser;
     bool want_write = false;
     bool closing = false;
+    bool dead = false;  // closed but kept alive until the current event batch ends
     // Ordered reply pipeline (submission seq -> slot). std::map keeps it sorted so
     // the front is always the next reply owed to the client.
     std::map<std::uint64_t, PendingReply> pipeline;
@@ -150,6 +151,10 @@ class Shard {
     MpscQueue<std::function<void()>> mailbox_;
 
     std::unordered_map<std::uint64_t, std::unique_ptr<Connection>> conns_;
+    // Connections closed mid-batch are parked here and freed once the batch (and
+    // its cross-shard completions) finish, so a stale reactor token can never
+    // dereference freed memory.
+    std::vector<std::unique_ptr<Connection>> pending_delete_;
     std::uint64_t next_conn_id_ = 1;
 
     int listen_fd_ = -1;
