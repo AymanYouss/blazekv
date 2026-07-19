@@ -1,0 +1,79 @@
+# BlazeKV runs as a StatefulSet: it owns its data (AOF + snapshots) on a
+# persistent volume, and the thread-per-core model means one pod saturates all
+# CPUs allocated to it. Scale vertically (more cores per pod) for throughput;
+# scale horizontally with client-side sharding or the replication roadmap.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: blazekv
+  namespace: blazekv
+  labels:
+    app.kubernetes.io/name: blazekv
+spec:
+  serviceName: blazekv
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blazekv
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: blazekv
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9121"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: blazekv
+          image: ghcr.io/aymanyouss/blazekv:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--bind=0.0.0.0"
+            - "--port=6380"
+            - "--dir=/data"
+            - "--appendonly=yes"
+            - "--appendfsync=everysec"
+            - "--metrics-port=9121"
+          ports:
+            - name: resp
+              containerPort: 6380
+            - name: metrics
+              containerPort: 9121
+          resources:
+            requests:
+              cpu: "4"
+              memory: 2Gi
+            limits:
+              cpu: "8"
+              memory: 8Gi
+          readinessProbe:
+            tcpSocket:
+              port: resp
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 20Gi

@@ -1,0 +1,18 @@
+# Prometheus Operator ServiceMonitor. Requires the CRD to be installed
+# (kube-prometheus-stack). Skip this file on clusters without the operator.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: blazekv
+  namespace: blazekv
+  labels:
+    app.kubernetes.io/name: blazekv
+    release: kube-prometheus-stack
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: blazekv
+  endpoints:
+    - port: metrics
+      path: /metrics
+      interval: 5s

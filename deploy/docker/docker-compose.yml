@@ -1,0 +1,71 @@
+name: blazekv
+
+# Full local stack: BlazeKV + Prometheus + Grafana + the web dashboard, plus a
+# Redis instance on the same network for side-by-side benchmarking.
+services:
+  blazekv:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    image: blazekv:latest
+    command: ["--bind", "0.0.0.0", "--port", "6380", "--dir", "/data",
+              "--appendonly", "yes", "--appendfsync", "everysec",
+              "--metrics-port", "9121"]
+    ports:
+      - "6380:6380"   # RESP
+      - "9121:9121"   # /metrics + dashboard API
+    volumes:
+      - blazekv-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/6380 && echo ok >&3"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "6379:6379"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - blazekv
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: blazekv
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ../../dashboard
+      dockerfile: Dockerfile
+    image: blazekv-dashboard:latest
+    environment:
+      BLAZEKV_API: http://blazekv:9121
+    ports:
+      - "3000:80"
+    depends_on:
+      - blazekv
+    restart: unless-stopped
+
+volumes:
+  blazekv-data:

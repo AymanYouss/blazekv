@@ -1,0 +1,12 @@
+build/
+cmake-build-*/
+dashboard/node_modules/
+dashboard/dist/
+bench/results/
+data/
+data_test/
+.git/
+docs/portfolio/
+*.log
+*.aof
+*.blaze

@@ -1,0 +1,58 @@
+name: Benchmark
+
+# Runs the reproducible BlazeKV vs Redis benchmark on the CI runner and publishes
+# the results JSON and comparison chart as build artifacts. Trigger manually or
+# on a version tag.
+on:
+  workflow_dispatch:
+    inputs:
+      requests:
+        description: "Requests per test (redis-benchmark)"
+        default: "1000000"
+      clients:
+        description: "Concurrent clients"
+        default: "50"
+      pipeline:
+        description: "Pipeline depth"
+        default: "1"
+  push:
+    tags: ["v*"]
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build liburing-dev redis-server redis-tools python3-matplotlib
+
+      - name: Build BlazeKV (release)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBLAZEKV_BUILD_TESTS=OFF \
+            -DBLAZEKV_USE_MIMALLOC=ON \
+            -DBLAZEKV_USE_URING=ON
+          cmake --build build --target blazekv-server -j"$(nproc)"
+
+      - name: Run benchmark
+        run: |
+          bench/run_benchmark.sh \
+            --requests "${{ github.event.inputs.requests || '1000000' }}" \
+            --clients "${{ github.event.inputs.clients || '50' }}" \
+            --pipeline "${{ github.event.inputs.pipeline || '1' }}"
+
+      - name: Plot results
+        run: python3 bench/plot_results.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            bench/results/results.json
+            bench/results/blazekv_vs_redis.png
