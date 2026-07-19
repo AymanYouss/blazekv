@@ -39,7 +39,7 @@ class SwissTable {
         Value value;
     };
 
-    SwissTable() { reserve(8); }
+    SwissTable() { rehash(kGroup); }
 
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
     [[nodiscard]] bool empty() const noexcept { return size_ == 0; }
@@ -76,7 +76,13 @@ class SwissTable {
     // Inserts or overwrites; returns {value*, inserted?}.
     template <class K, class V>
     std::pair<Value*, bool> insert_or_assign(K&& key, V&& value) {
-        if (BLAZEKV_UNLIKELY(size_ + 1 > grow_at_)) rehash(capacity_ * 2);
+        if (BLAZEKV_UNLIKELY(size_ + 1 > grow_at_)) {
+            rehash(capacity_ * 2);
+        } else if (BLAZEKV_UNLIKELY(size_ + tombstones_ + 1 > grow_at_)) {
+            // Occupancy (live + tombstones) is too high; rebuild at the same size
+            // to reclaim tombstones so a probe always terminates on an empty slot.
+            rehash(capacity_);
+        }
         const std::uint64_t h = hasher_(key);
         std::size_t pos = h1(h) & mask_;
         const std::int8_t needle = h2(h);
@@ -99,6 +105,7 @@ class SwissTable {
             }
             pos = (pos + kGroup) & mask_;
         }
+        if (ctrl_[insert_at] == kDeleted) --tombstones_;  // reusing a tombstone
         set_ctrl(insert_at, needle);
         slots_[insert_at].key = std::forward<K>(key);
         slots_[insert_at].value = std::forward<V>(value);
@@ -117,16 +124,15 @@ class SwissTable {
             while (match) {
                 const std::size_t i = (pos + ctz(match)) & mask_;
                 if (eq_(slots_[i].key, key)) {
-                    // A tombstone is only required if the group has no empty slot;
-                    // otherwise we can mark empty and reclaim the probe budget.
-                    if (MatchEmpty(group)) {
-                        set_ctrl(i, kEmpty);
-                    } else {
-                        set_ctrl(i, kDeleted);
-                    }
+                    // Always leave a tombstone: deciding when an empty is safe
+                    // requires inspecting neighbouring groups, and accumulated
+                    // tombstones are reclaimed by a same-size rehash on the next
+                    // insert (see insert_or_assign). This keeps probing correct.
+                    set_ctrl(i, kDeleted);
                     slots_[i].key = Key{};
                     slots_[i].value = Value{};
                     --size_;
+                    ++tombstones_;
                     return true;
                 }
                 match &= match - 1;
@@ -153,6 +159,7 @@ class SwissTable {
         std::memset(ctrl_, kEmpty, capacity_ + kGroup);
         for (std::size_t i = 0; i < capacity_; ++i) slots_[i] = Slot{};
         size_ = 0;
+        tombstones_ = 0;
     }
 
    private:
@@ -248,6 +255,7 @@ class SwissTable {
         ctrl_ = ctrl_store_.data();
         slots_ = slots_store_.data();
         size_ = 0;
+        tombstones_ = 0;
 
         for (std::size_t i = 0; i < old_cap; ++i) {
             if (old_ctrl[i] >= 0) {
@@ -282,6 +290,7 @@ class SwissTable {
     std::size_t capacity_ = 0;
     std::size_t mask_ = 0;
     std::size_t size_ = 0;
+    std::size_t tombstones_ = 0;
     std::size_t grow_at_ = 0;
     Hash hasher_{};
     KeyEq eq_{};
