@@ -1,0 +1,38 @@
+# Build
+build/
+cmake-build-*/
+out/
+*.o
+*.a
+*.so
+*.dylib
+compile_commands.json
+.cache/
+
+# Persistence artifacts
+*.aof
+*.blaze
+dump.rdb
+data/
+data_test/
+*.log
+
+# Node / dashboard
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+*.local
+
+# Editors
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+.DS_Store
+
+# Benchmarks
+bench/results/*.json
+bench/results/*.txt
+bench/results/*.svg
+perf.data*
+*.folded

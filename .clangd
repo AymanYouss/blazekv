@@ -1,0 +1,10 @@
+CompileFlags:
+  Add:
+    - -std=c++20
+    - -I/Users/youssayman/blazekv/include
+    - -I/Users/youssayman/blazekv/build/generated
+    - -DBLAZEKV_USE_MIMALLOC=0
+  Compiler: clang++
+
+Diagnostics:
+  UnusedIncludes: None
