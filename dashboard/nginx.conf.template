@@ -1,0 +1,26 @@
+server {
+    listen 80;
+    server_name _;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    gzip on;
+    gzip_types text/css application/javascript application/json image/svg+xml;
+
+    # Single-page app: fall back to index.html for client-side routes.
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Proxy the observability API and Prometheus endpoint to the BlazeKV server.
+    location /api/ {
+        proxy_pass ${BLAZEKV_API};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+    }
+    location /metrics {
+        proxy_pass ${BLAZEKV_API};
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+    }
+}
